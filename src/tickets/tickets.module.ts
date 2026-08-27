@@ -4,6 +4,8 @@ import { Ticket, TicketSchema } from './schemas/ticket.schema';
 import { User, UserSchema } from '../users/schemas/user.schema';
 import { TicketsController } from './tickets.controller';
 import { TicketsService } from './tickets.service';
+import { NotificationsModule } from '../notifications/notifications.module';
+import { EventsModule } from '../common/events.module';
 
 @Module({
   imports: [
@@ -11,6 +13,8 @@ import { TicketsService } from './tickets.service';
       { name: Ticket.name, schema: TicketSchema },
       { name: User.name, schema: UserSchema },
     ]),
+    NotificationsModule,
+    EventsModule,
   ],
   controllers: [TicketsController],
   providers: [TicketsService],

@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
@@ -12,6 +13,9 @@ import { CreateTicketDto } from './dto/create-ticket.dto';
 import { UpdateStatusDto } from './dto/update-status.dto';
 import { Role } from '../common/enums/role.enum';
 import { TicketStatus } from '../common/enums/ticket-status.enum';
+import { NotificationsService } from '../notifications/notifications.service';
+import { NotificationType } from '../notifications/schemas/notification.schema';
+import { EventsGateway } from '../common/events.gateway';
 
 /** A ticket counts as overdue when it has been active (unresolved) for more than this many hours. */
 export const OVERDUE_THRESHOLD_HOURS = 48;
@@ -30,11 +34,23 @@ const ALLOWED_TRANSITIONS: Record<TicketStatus, TicketStatus[]> = {
   [TicketStatus.CLOSED]: [],
 };
 
+const STATUS_LABELS: Record<string, string> = {
+  [TicketStatus.OPEN]: 'Open',
+  [TicketStatus.IN_PROGRESS]: 'In Progress',
+  [TicketStatus.BLOCKED]: 'Blocked',
+  [TicketStatus.RESOLVED]: 'Resolved',
+  [TicketStatus.CLOSED]: 'Closed',
+};
+
 @Injectable()
 export class TicketsService {
+  private readonly logger = new Logger(TicketsService.name);
+
   constructor(
     @InjectModel(Ticket.name) private ticketModel: Model<TicketDocument>,
     @InjectModel(User.name) private userModel: Model<UserDocument>,
+    private notificationsService: NotificationsService,
+    private eventsGateway: EventsGateway,
   ) {}
 
   async create(createTicketDto: CreateTicketDto, requesterId: string): Promise<TicketDocument> {
@@ -50,7 +66,28 @@ export class TicketsService {
       ],
     });
     const saved = await newTicket.save();
-    return this.findOne(saved._id.toString());
+
+    this.userModel
+      .find({ role: { $in: [Role.SUPPORT, Role.MANAGER] } })
+      .select('_id')
+      .exec()
+      .then((staff) => {
+        for (const member of staff) {
+          this.notificationsService.notify(
+            member._id.toString(),
+            NotificationType.TICKET_CREATED,
+            saved._id.toString(),
+            `New ticket: ${createTicketDto.title}`,
+            `${createTicketDto.description || 'No description provided'}`,
+            false,
+          );
+        }
+      })
+      .catch((err) => this.logger.error(`Failed to notify staff on new ticket: ${err.message}`));
+
+    const ticket = await this.findOne(saved._id.toString());
+    this.eventsGateway.broadcast('ticket.created', ticket);
+    return ticket;
   }
 
   async findAll(user: { userId: string; role: Role }): Promise<TicketDocument[]> {
@@ -103,7 +140,24 @@ export class TicketsService {
     ticket.claimedAt = new Date();
     this.pushEvent(ticket, { type: TicketEventType.CLAIMED, byId: new Types.ObjectId(userId) });
     await ticket.save();
-    return this.findOne(id);
+
+    const staffMember = await this.userModel.findById(userId).select('name').exec();
+    const ticketDoc = await this.findOne(id);
+    const requester = ticketDoc.requesterId as any;
+
+    this.notificationsService
+      .notify(
+        requester._id.toString(),
+        NotificationType.TICKET_CLAIMED,
+        id,
+        `Your ticket has been claimed`,
+        `${staffMember?.name || 'Support'} is now working on "${ticketDoc.title}"`,
+        false,
+      )
+      .catch((err) => this.logger.error(`Claim notification failed: ${err.message}`));
+
+    this.eventsGateway.broadcast('ticket.updated', ticketDoc);
+    return ticketDoc;
   }
 
   async changeStatus(id: string, userId: string, dto: UpdateStatusDto): Promise<TicketDocument> {
@@ -122,7 +176,9 @@ export class TicketsService {
       );
     }
 
+    const prevStatus = ticket.status;
     const nextStatus = dto.status as TicketStatus;
+
     if (nextStatus === TicketStatus.BLOCKED) {
       if (!dto.blockerReason?.trim() || !dto.nextAction?.trim()) {
         throw new BadRequestException(
@@ -147,7 +203,7 @@ export class TicketsService {
     this.pushEvent(ticket, {
       type: TicketEventType.STATUS_CHANGED,
       byId: new Types.ObjectId(userId),
-      fromStatus: ticket.status,
+      fromStatus: prevStatus,
       toStatus: nextStatus,
       message:
         nextStatus === TicketStatus.RESOLVED
@@ -157,7 +213,26 @@ export class TicketsService {
             : undefined,
     });
     await ticket.save();
-    return this.findOne(id);
+
+    const ticketDoc = await this.findOne(id);
+    const requester = ticketDoc.requesterId as any;
+
+    let notifyUserId = requester._id.toString();
+    let notifTitle = `Ticket status changed to ${STATUS_LABELS[nextStatus]}`;
+    let notifMessage = `Your ticket "${ticketDoc.title}" is now ${STATUS_LABELS[nextStatus]}`;
+
+    if (nextStatus === TicketStatus.BLOCKED) {
+      notifMessage = `Your ticket "${ticketDoc.title}" has been blocked. Reason: ${dto.blockerReason?.trim()}`;
+    } else if (nextStatus === TicketStatus.RESOLVED) {
+      notifMessage = `Your ticket "${ticketDoc.title}" has been resolved. Resolution: ${dto.resolution?.trim()}`;
+    }
+
+    this.notificationsService
+      .notify(notifyUserId, NotificationType.STATUS_CHANGED, id, notifTitle, notifMessage)
+      .catch((err) => this.logger.error(`Status change notification failed: ${err.message}`));
+
+    this.eventsGateway.broadcast('ticket.updated', ticketDoc);
+    return ticketDoc;
   }
 
   async addComment(id: string, userId: string, message: string): Promise<TicketDocument> {
@@ -172,7 +247,33 @@ export class TicketsService {
       message: message.trim(),
     });
     await ticket.save();
-    return this.findOne(id);
+
+    const ticketDoc = await this.findOne(id);
+    const requester = ticketDoc.requesterId as any;
+    const owner = ticketDoc.ownerId as any;
+
+    const commenter = await this.userModel.findById(userId).select('name role').exec();
+    const isEmployee = commenter?.role === Role.EMPLOYEE;
+
+    const notifyUserId = isEmployee
+      ? owner?._id?.toString()
+      : requester._id.toString();
+
+    if (notifyUserId) {
+      const label = isEmployee ? (requester as any).name : commenter?.name || 'Support';
+      this.notificationsService
+        .notify(
+          notifyUserId,
+          NotificationType.COMMENT,
+          id,
+          `New comment on "${ticketDoc.title}"`,
+          `${label}: ${message.trim().substring(0, 200)}`,
+        )
+        .catch((err) => this.logger.error(`Comment notification failed: ${err.message}`));
+    }
+
+    this.eventsGateway.broadcast('ticket.updated', ticketDoc);
+    return ticketDoc;
   }
 
   async close(id: string, requesterId: string): Promise<TicketDocument> {
@@ -196,7 +297,25 @@ export class TicketsService {
       toStatus: TicketStatus.CLOSED,
     });
     await ticket.save();
-    return this.findOne(id);
+
+    const ticketDoc = await this.findOne(id);
+    const owner = ticketDoc.ownerId as any;
+
+    if (owner?._id) {
+      this.notificationsService
+        .notify(
+          owner._id.toString(),
+          NotificationType.TICKET_CLOSED,
+          id,
+          `Ticket closed by requester`,
+          `"${ticketDoc.title}" has been closed.`,
+          false,
+        )
+        .catch((err) => this.logger.error(`Close notification failed: ${err.message}`));
+    }
+
+    this.eventsGateway.broadcast('ticket.updated', ticketDoc);
+    return ticketDoc;
   }
 
   async assign(id: string, targetUserId: string, managerId: string): Promise<TicketDocument> {
@@ -234,7 +353,22 @@ export class TicketsService {
         : `Assigned to ${target.name}`,
     });
     await ticket.save();
-    return this.findOne(id);
+
+    const ticketDoc = await this.findOne(id);
+
+    this.notificationsService
+      .notify(
+        targetUserId,
+        NotificationType.TICKET_ASSIGNED,
+        id,
+        `Ticket assigned to you`,
+        `"${ticketDoc.title}" has been assigned to you.`,
+        true,
+      )
+      .catch((err) => this.logger.error(`Assign notification (target) failed: ${err.message}`));
+
+    this.eventsGateway.broadcast('ticket.updated', ticketDoc);
+    return ticketDoc;
   }
 
   async getStats() {
